@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  ollama:
+    container_name: ollama
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - llm-network
+
+  llm-api:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - APP_ENV=production
+      - OLLAMA_MODEL=llama3.2
+      - OLLAMA_HOST=ollama
+      - API_PORT=8080
+      - MAX_REQUESTS=50
+      - RATE_LIMIT_PERIOD=60s
+      - LOG_LEVEL=info
+    depends_on:
+      - ollama
+    networks:
+      - llm-network
+    restart: unless-stopped
+
+networks:
+  llm-network:
+    driver: bridge
+
+volumes:
+  ollama-data:
+    driver: local

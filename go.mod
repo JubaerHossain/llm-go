@@ -2,7 +2,10 @@ module github.com/JubaerHossain/llm-go
 
 go 1.23.2
 
-require github.com/tmc/langchaingo v0.1.12
+require (
+	github.com/rs/cors v1.11.1
+	github.com/tmc/langchaingo v0.1.12
+)
 
 require (
 	github.com/dlclark/regexp2 v1.10.0 // indirect

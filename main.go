@@ -7,79 +7,74 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/rs/cors"
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/ollama"
 )
 
-// Config holds our application configuration
 type Config struct {
 	OllamaModel     string
+	OllamaServerURL string
 	APIPort         string
 	MaxRequests     int
 	RateLimitPeriod time.Duration
+	MaxGoroutines   int
 }
 
-// Request struct for incoming JSON payload
 type Request struct {
 	Query string `json:"query"`
 }
 
-// Response struct for JSON output
 type Response struct {
 	Answer string `json:"answer"`
+	Error  string `json:"error,omitempty"`
 }
 
-// Initialize and return configurations
 func loadConfig() Config {
-	config := Config{
+	return Config{
 		OllamaModel:     getEnv("OLLAMA_MODEL", "llama3.2"),
+		OllamaServerURL: getEnv("OLLAMA_SERVER_URL", "http://ollama:11434"),
 		APIPort:         getEnv("API_PORT", "8080"),
 		MaxRequests:     getEnvAsInt("MAX_REQUESTS", 10),
 		RateLimitPeriod: getEnvAsDuration("RATE_LIMIT_PERIOD", 60*time.Second),
+		MaxGoroutines:   getEnvAsInt("MAX_GOROUTINES", 100),
 	}
-	return config
 }
 
 func getEnv(key, defaultValue string) string {
-	value := os.Getenv(key)
-	if value == "" {
-		return defaultValue
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
-	return value
+	return defaultValue
 }
 
 func getEnvAsInt(key string, defaultValue int) int {
-	value := os.Getenv(key)
-	if value == "" {
-		return defaultValue
+	if value := os.Getenv(key); value != "" {
+		var result int
+		if _, err := fmt.Sscan(value, &result); err == nil {
+			return result
+		}
 	}
-	var result int
-	_, err := fmt.Sscan(value, &result)
-	if err != nil {
-		return defaultValue
-	}
-	return result
+	return defaultValue
 }
 
 func getEnvAsDuration(key string, defaultValue time.Duration) time.Duration {
-	value := os.Getenv(key)
-	if value == "" {
-		return defaultValue
+	if value := os.Getenv(key); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil {
+			return duration
+		}
 	}
-	duration, err := time.ParseDuration(value)
-	if err != nil {
-		return defaultValue
-	}
-	return duration
+	return defaultValue
 }
 
 type RateLimiter struct {
 	mu              sync.Mutex
-	lastRequest     time.Time
+	lastReset       time.Time
 	requestCount    int
 	maxRequests     int
 	rateLimitPeriod time.Duration
@@ -87,8 +82,7 @@ type RateLimiter struct {
 
 func newRateLimiter(maxRequests int, rateLimitPeriod time.Duration) *RateLimiter {
 	return &RateLimiter{
-		lastRequest:     time.Now(),
-		requestCount:    0,
+		lastReset:       time.Now(),
 		maxRequests:     maxRequests,
 		rateLimitPeriod: rateLimitPeriod,
 	}
@@ -99,20 +93,21 @@ func (rl *RateLimiter) Allow() bool {
 	defer rl.mu.Unlock()
 
 	now := time.Now()
-	if now.Sub(rl.lastRequest) > rl.rateLimitPeriod {
+	if now.Sub(rl.lastReset) > rl.rateLimitPeriod {
 		rl.requestCount = 0
+		rl.lastReset = now
 	}
 	if rl.requestCount < rl.maxRequests {
 		rl.requestCount++
-		rl.lastRequest = now
 		return true
 	}
 	return false
 }
 
-// processLLMRequest handles the LLM processing
 func processLLMRequest(llm llms.LLM, query string) (Response, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	var response string
 	_, err := llm.Call(ctx, fmt.Sprintf("Human: %s\nAssistant:", query),
 		llms.WithTemperature(0.8),
@@ -122,109 +117,88 @@ func processLLMRequest(llm llms.LLM, query string) (Response, error) {
 		}),
 	)
 	if err != nil {
-		return Response{}, fmt.Errorf("error during LLM call: %v", err)
+		return Response{}, fmt.Errorf("LLM error: %w", err)
 	}
 
-	return Response{
-		Answer: response,
-	}, nil
+	return Response{Answer: response}, nil
 }
 
 func main() {
-	// Load configurations
 	config := loadConfig()
-
-	// Initialize the rate limiter
 	rateLimiter := newRateLimiter(config.MaxRequests, config.RateLimitPeriod)
 
-	// Initialize the LLM with the Ollama model
-	llm, err := ollama.New(ollama.WithModel(config.OllamaModel))
+	llm, err := ollama.New(
+		ollama.WithModel(config.OllamaModel),
+		ollama.WithServerURL(config.OllamaServerURL),
+	)
 	if err != nil {
 		log.Fatalf("Failed to initialize LLM: %v", err)
 	}
 
-	// Define the chat endpoint
-	http.HandleFunc("/chat", func(w http.ResponseWriter, r *http.Request) {
-		// Rate limiting
-		if !rateLimiter.Allow() {
-			http.Error(w, "Too many requests", http.StatusTooManyRequests)
-			return
-		}
-
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-		// Handle OPTIONS request for CORS preflight
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		// Only handle POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse request body
-		var req Request
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Error decoding request body", http.StatusBadRequest)
-			return
-		}
-
-		// Validate query
-		if strings.TrimSpace(req.Query) == "" {
-			http.Error(w, "Empty query", http.StatusBadRequest)
-			return
-		}
-
-		// Log the received query
-		log.Printf("Received query from %s: %s", r.RemoteAddr, req.Query)
-
-		// Create channels for response and error
-		responseChan := make(chan Response, 1)
-		errorChan := make(chan error, 1)
-
-		// Process LLM request in a goroutine
-		go func() {
-			resp, err := processLLMRequest(llm, req.Query)
-			if err != nil {
-				errorChan <- err
-				return
-			}
-			responseChan <- resp
-		}()
-
-		// Wait for response or error with timeout
-		select {
-		case resp := <-responseChan:
-			// Serialize and send the response
-			respJson, err := json.Marshal(resp)
-			if err != nil {
-				http.Error(w, "Error creating response", http.StatusInternalServerError)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			w.Write(respJson)
-
-		case err := <-errorChan:
-			log.Println(err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-
-		case <-time.After(30 * time.Second):
-			http.Error(w, "Request timed out", http.StatusRequestTimeout)
-		}
+	sem := make(chan struct{}, config.MaxGoroutines)
+	c := cors.New(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{http.MethodPost, http.MethodOptions},
+		AllowedHeaders: []string{"Content-Type"},
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%s", config.APIPort)
-	log.Printf("Server is running on port %s", config.APIPort)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Hello, World!"))
+	})
 
-	if err := http.ListenAndServe(serverAddr, nil); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	mux.HandleFunc("/chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if !rateLimiter.Allow() {
+			http.Error(w, `{"error":"Too many requests"}`, http.StatusTooManyRequests)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"Only POST method is allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req Request
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Query) == "" {
+			http.Error(w, `{"error":"Invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+
+		log.Printf("Query from %s: %s", r.RemoteAddr, req.Query)
+
+		sem <- struct{}{}
+		defer func() { <-sem }()
+
+		response, err := processLLMRequest(llm, req.Query)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"%v"}`, err), http.StatusInternalServerError)
+			return
+		}
+
+		respJson, _ := json.Marshal(response)
+		w.WriteHeader(http.StatusOK)
+		w.Write(respJson)
+	})
+
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%s", config.APIPort),
+		Handler: c.Handler(mux),
 	}
+
+	go func() {
+		log.Printf("Server running on port %s", config.APIPort)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt)
+	<-quit
+
+	log.Println("Shutting down server...")
+	server.Shutdown(context.Background())
 }
