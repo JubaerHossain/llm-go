@@ -128,6 +128,10 @@ func processLLMRequest(query string, requestID string, conn *websocket.Conn) {
 
         _, err := llm.Call(ctx, fmt.Sprintf("Human: %s\nAssistant:", query),
             llms.WithTemperature(0.8),
+			llms.WithMaxTokens(100),
+			llms.WithTopP(0.9),
+			llms.WithFrequencyPenalty(0.0),
+			llms.WithPresencePenalty(0.0),
             llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
                 select {
 				case <-ctx.Done():
