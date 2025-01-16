@@ -116,20 +116,19 @@ var upgrader = websocket.Upgrader{
 }
 
 func processLLMRequest(query string, requestID string, conn *websocket.Conn) {
-	maxRetries := 3
-	retryDelay := 2 * time.Second
+    maxRetries := 3
+    retryDelay := 2 * time.Second
     log.Printf("RequestID: %s, Query: %s - Starting LLM request", requestID, query)
 
-
-	for i := 0; i <= maxRetries; i++ {
-        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    for i := 0; i <= maxRetries; i++ {
+        ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second) // Increased timeout
         defer cancel()
 
         var response string
 
-		_, err := llm.Call(ctx, fmt.Sprintf("Human: %s\nAssistant:", query),
-			llms.WithTemperature(0.8),
-			llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
+        _, err := llm.Call(ctx, fmt.Sprintf("Human: %s\nAssistant:", query),
+            llms.WithTemperature(0.8),
+            llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
                 select {
 				case <-ctx.Done():
                     log.Printf("RequestID: %s, Query: %s - Streaming context canceled: %v", requestID, query, ctx.Err())
@@ -145,35 +144,38 @@ func processLLMRequest(query string, requestID string, conn *websocket.Conn) {
                     err := conn.WriteJSON(Response{Answer: string(chunk)})
 					if err != nil {
 						log.Printf("RequestID: %s, Query: %s - Error sending chunk over websocket: %v", requestID, query, err)
-						return err // If we fail to send, stop streaming.
+                         if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway){
+                            return err
+                         }
+                        return fmt.Errorf("error writing to websocket %w", err)
 					}
                     return nil
                 }
-			}),
-		)
+            }),
+        )
 
-		if err == nil {
+        if err == nil {
             log.Printf("RequestID: %s, Query: %s - LLM request successful", requestID, query)
-
-            err := conn.WriteJSON(Response{Answer: response}) //send full response
+            err := conn.WriteJSON(Response{Answer: response})
             if err != nil {
                 log.Printf("RequestID: %s, Query: %s - Error sending final response over websocket: %v", requestID, query, err)
+                   if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway){
+                     return
+                   }
             }
 			return
-		}
-
-        log.Printf("RequestID: %s, Query: %s - LLM request failed (attempt %d/%d): %v", requestID, query, i+1, maxRetries+1, err)
-        if i < maxRetries {
-            time.Sleep(retryDelay)
-            retryDelay *= 2
         }
+        log.Printf("RequestID: %s, Query: %s - LLM request failed (attempt %d/%d): %v", requestID, query, i+1, maxRetries+1, err)
+		if i < maxRetries {
+			time.Sleep(retryDelay)
+			retryDelay *= 2
+		}
     }
 	log.Printf("RequestID: %s, Query: %s - LLM request failed after %d retries", requestID, query, maxRetries)
-
     err := conn.WriteJSON(Response{Error: fmt.Sprintf("LLM request failed after %d retries", maxRetries)})
-	if err != nil {
-		log.Printf("RequestID: %s, Query: %s - Error sending error over websocket: %v", requestID, query, err)
-	}
+    if err != nil {
+        log.Printf("RequestID: %s, Query: %s - Error sending final error over websocket: %v", requestID, query, err)
+    }
 }
 
 
@@ -227,13 +229,12 @@ func main() {
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				   log.Printf("RequestID: %s, - WebSocket closed by client", requestID)
-                   break
-				} else {
-					log.Printf("RequestID: %s, - Error reading message: %v", requestID, err)
-					break
-				}
+               if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+                  log.Printf("RequestID: %s, - WebSocket closed by client", requestID)
+                  break
+               }
+               log.Printf("RequestID: %s, - Error reading message: %v", requestID, err)
+               break
 			}
 
 			var req Request
