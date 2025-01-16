@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/rs/cors"
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/ollama"
@@ -31,13 +33,13 @@ type Request struct {
 }
 
 type Response struct {
-	Answer string `json:"answer"`
+	Answer string `json:"answer,omitempty"`
 	Error  string `json:"error,omitempty"`
 }
 
 func loadConfig() Config {
 	return Config{
-		OllamaModel:     getEnv("OLLAMA_MODEL", "llama3.2"),
+		OllamaModel:     getEnv("OLLAMA_MODEL", "llama3"),
 		OllamaServerURL: getEnv("OLLAMA_SERVER_URL", "http://ollama:11434"),
 		APIPort:         getEnv("API_PORT", "8080"),
 		MaxRequests:     getEnvAsInt("MAX_REQUESTS", 10),
@@ -104,30 +106,84 @@ func (rl *RateLimiter) Allow() bool {
 	return false
 }
 
-func processLLMRequest(llm llms.LLM, query string) (Response, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	var response string
-	_, err := llm.Call(ctx, fmt.Sprintf("Human: %s\nAssistant:", query),
-		llms.WithTemperature(0.8),
-		llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
-			response += string(chunk)
-			return nil
-		}),
-	)
-	if err != nil {
-		return Response{}, fmt.Errorf("LLM error: %w", err)
-	}
-
-	return Response{Answer: response}, nil
+var llm llms.LLM // Declare llm as a global variable
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all connections
+	},
 }
+
+func processLLMRequest(query string, requestID string, conn *websocket.Conn) {
+	maxRetries := 3
+	retryDelay := 2 * time.Second
+    log.Printf("RequestID: %s, Query: %s - Starting LLM request", requestID, query)
+
+
+	for i := 0; i <= maxRetries; i++ {
+        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer cancel()
+
+        var response string
+
+		_, err := llm.Call(ctx, fmt.Sprintf("Human: %s\nAssistant:", query),
+			llms.WithTemperature(0.8),
+			llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
+                select {
+				case <-ctx.Done():
+                    log.Printf("RequestID: %s, Query: %s - Streaming context canceled: %v", requestID, query, ctx.Err())
+                    err := conn.WriteJSON(Response{Error: "Stream Cancelled"})
+					if err != nil {
+						log.Printf("RequestID: %s, Query: %s - Error sending cancellation over websocket: %v", requestID, query, err)
+					}
+					return ctx.Err()
+
+                default:
+                    log.Printf("RequestID: %s, Query: %s - Chunk: %s", requestID, query, string(chunk))
+					response += string(chunk)
+                    err := conn.WriteJSON(Response{Answer: string(chunk)})
+					if err != nil {
+						log.Printf("RequestID: %s, Query: %s - Error sending chunk over websocket: %v", requestID, query, err)
+						return err // If we fail to send, stop streaming.
+					}
+                    return nil
+                }
+			}),
+		)
+
+		if err == nil {
+            log.Printf("RequestID: %s, Query: %s - LLM request successful", requestID, query)
+
+            err := conn.WriteJSON(Response{Answer: response}) //send full response
+            if err != nil {
+                log.Printf("RequestID: %s, Query: %s - Error sending final response over websocket: %v", requestID, query, err)
+            }
+			return
+		}
+
+        log.Printf("RequestID: %s, Query: %s - LLM request failed (attempt %d/%d): %v", requestID, query, i+1, maxRetries+1, err)
+        if i < maxRetries {
+            time.Sleep(retryDelay)
+            retryDelay *= 2
+        }
+    }
+	log.Printf("RequestID: %s, Query: %s - LLM request failed after %d retries", requestID, query, maxRetries)
+
+    err := conn.WriteJSON(Response{Error: fmt.Sprintf("LLM request failed after %d retries", maxRetries)})
+	if err != nil {
+		log.Printf("RequestID: %s, Query: %s - Error sending error over websocket: %v", requestID, query, err)
+	}
+}
+
 
 func main() {
 	config := loadConfig()
 	rateLimiter := newRateLimiter(config.MaxRequests, config.RateLimitPeriod)
 
-	llm, err := ollama.New(
+
+    var err error
+	llm, err = ollama.New(
 		ollama.WithModel(config.OllamaModel),
 		ollama.WithServerURL(config.OllamaServerURL),
 	)
@@ -138,7 +194,7 @@ func main() {
 	sem := make(chan struct{}, config.MaxGoroutines)
 	c := cors.New(cors.Options{
 		AllowedOrigins: []string{"*"},
-		AllowedMethods: []string{http.MethodPost, http.MethodOptions},
+		AllowedMethods: []string{http.MethodGet, http.MethodOptions, http.MethodPost},
 		AllowedHeaders: []string{"Content-Type"},
 	})
 
@@ -148,39 +204,60 @@ func main() {
 		w.Write([]byte("Hello, World!"))
 	})
 
+
 	mux.HandleFunc("/chat", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
+
 
 		if !rateLimiter.Allow() {
 			http.Error(w, `{"error":"Too many requests"}`, http.StatusTooManyRequests)
 			return
 		}
 
-		if r.Method != http.MethodPost {
-			http.Error(w, `{"error":"Only POST method is allowed"}`, http.StatusMethodNotAllowed)
+        conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("Error upgrading connection to websocket: %v", err)
 			return
 		}
+        defer conn.Close()
 
-		var req Request
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Query) == "" {
-			http.Error(w, `{"error":"Invalid request body"}`, http.StatusBadRequest)
-			return
-		}
-
-		log.Printf("Query from %s: %s", r.RemoteAddr, req.Query)
+        requestID := uuid.New().String()
 
 		sem <- struct{}{}
 		defer func() { <-sem }()
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				   log.Printf("RequestID: %s, - WebSocket closed by client", requestID)
+                   break
+				} else {
+					log.Printf("RequestID: %s, - Error reading message: %v", requestID, err)
+					break
+				}
+			}
 
-		response, err := processLLMRequest(llm, req.Query)
-		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"%v"}`, err), http.StatusInternalServerError)
-			return
+			var req Request
+			if err := json.Unmarshal(msg, &req); err != nil {
+				log.Printf("RequestID: %s, - Error unmarshalling message: %v", requestID, err)
+				err := conn.WriteJSON(Response{Error: "Invalid message format"})
+				if err != nil {
+					log.Printf("RequestID: %s - Error sending error over websocket: %v",requestID, err)
+				}
+				continue
+			}
+
+			if strings.TrimSpace(req.Query) == "" {
+				log.Printf("RequestID: %s - Received empty query", requestID)
+                 err := conn.WriteJSON(Response{Error: "Invalid query"})
+				if err != nil {
+					log.Printf("RequestID: %s - Error sending error over websocket: %v",requestID, err)
+				}
+				continue
+			}
+
+			log.Printf("RequestID: %s, Query from %s: %s", requestID, r.RemoteAddr, req.Query)
+			processLLMRequest(req.Query, requestID, conn)
 		}
-
-		respJson, _ := json.Marshal(response)
-		w.WriteHeader(http.StatusOK)
-		w.Write(respJson)
 	})
 
 	server := &http.Server{

@@ -93,6 +93,10 @@ docker-build:
 up:
 	@echo "${GREEN}Starting services with Docker Compose...${NC}"
 	$(DOCKER_COMPOSE) up --build -d
+.PHONY: react-up
+react-up:
+	@echo "${GREEN}Starting services with Docker Compose...${NC}"
+	$(DOCKER_COMPOSE) up --build -d react-app
 
 .PHONY: down
 down:
